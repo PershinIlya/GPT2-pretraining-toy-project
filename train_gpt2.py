@@ -33,7 +33,6 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -86,7 +85,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T) where T is the sequence length
         B, T = idx.size()
         assert T <= self.config.block_size, f'Cannot forward, model block size is exhausted, {T} > {self.config.block_size}'
@@ -101,7 +100,11 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        return logits
+        # calculate the loss
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -146,40 +149,113 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read() 
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(tokens)} tokens")
+        print(f"1 epoch = {len(tokens) // (B * T)} batches"
+              
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position + B * T + 1]
+        x = (buf[:-1]).view(B, T)  # inputs
+        y = (buf[1:]).view(B, T)   # targets
+        # move the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would overrun the tokens, reset the position
+        if self.current_position + B * T + 1 >= len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+    
+
+def main():
+
+    # autodetect the device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    device = 'cpu'
+    print(f"using device: {device}")
+
+    # get a data batch
+    import tiktoken
+    enc = tiktoken.get_encoding('gpt2')
+    with open('input.txt', 'r') as f:
+        text = f.read()
+    text = text[:1000]
+    tokens = enc.encode(text)
+    B, T = 4, 32
+    buf = torch.tensor(tokens[:B * T + 1])
+    buf = buf.to(device)
+    x = buf[:-1].view(B, T)
+    y = buf[1:].view(B, T)
+
+    # get logits
+    model = GPT(GPTConfig())
+    model.to(device)
+
+    # optimize
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    for i in range(10):
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f"step {i}, loss: {loss.item()}")
+
+    import sys; sys.exit(0)
 
 
-num_return_sequences = 5
-max_length = 30
-model = GPT.from_pretrained('gpt2')
-model.eval()
-# model.to('cuda')
+    # prefix tokens
+    model.eval()
 
-# prefix tokens
-import tiktoken 
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-# x = tokens.to('cuda')
-x = tokens
+    num_return_sequences = 5
+    max_length = 30
 
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-torch.manual_seed(42)
-# torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x)  # (B, T, vocab_size)
-        logits = logits[:, -1, :]  # (B, vocab_size)
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, num_samples=1)
-        xcol = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x, xcol), dim=1)
+    import tiktoken 
+    enc = tiktoken.get_encoding('gpt2')
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    x = tokens.to(device)
+    x = tokens
 
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+    # generate! right now x is (B, T) where B = 5, T = 8
+    # set the seed to 42
+    torch.manual_seed(42)
+    # torch.cuda.manual_seed(42)
+    while x.size(1) < max_length:
+        # forward the model to get the logits
+        with torch.no_grad():
+            logits = model(x)  # (B, T, vocab_size)
+            logits = logits[:, -1, :]  # (B, vocab_size)
+            probs = F.softmax(logits, dim=-1)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            ix = torch.multinomial(topk_probs, num_samples=1)
+            xcol = torch.gather(topk_indices, -1, ix)
+            x = torch.cat((x, xcol), dim=1)
+
+    # print the generated text
+    for i in range(num_return_sequences):
+        tokens = x[i, :max_length].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)
+
+
+main()
