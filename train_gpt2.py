@@ -1,8 +1,10 @@
 from dataclasses import dataclass 
 import math
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import tiktoken
 
 
 class CausalSelfAttention(nn.Module):
@@ -98,7 +100,7 @@ class GPT(nn.Module):
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std *= (2 * self.config.n_layer) ** -0.5
-            torch.nn.inint.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -227,6 +229,8 @@ def main():
 
     train_loader = DataLoaderLite(B=4, T=32)
 
+    torch.set_float32_matmul_precision('high')
+
     # get logits
     model = GPT(GPTConfig())
     model.to(device)
@@ -234,13 +238,18 @@ def main():
     # optimize
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for i in range(10):
+        t0 = time.time()
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        print(f"step {i}, loss: {loss.item()}")
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000  # time diff in ms
+        print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
 
     import sys; sys.exit(0)
 
