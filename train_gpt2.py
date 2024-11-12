@@ -201,9 +201,11 @@ class GPT(nn.Module):
 
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them in memory
         with open('input.txt', 'r') as f:
@@ -215,7 +217,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(tokens) // (B * T)} batches")
               
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -223,10 +225,10 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)   # targets
         # move the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would overrun the tokens, reset the position
-        if self.current_position + B * T + 1 >= len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 
@@ -285,14 +287,17 @@ def main():
     print("Bye!")
     import sys; sys.exit(0)
 
-    train_loader = DataLoaderLite(B=B, T=T)
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
     torch.set_float32_matmul_precision('high')
 
-    # get logits
+    # create model
     model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
     model = torch.compile(model)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model
 
     max_lr = 3e-4
     min_lr = max_lr * 0.1
@@ -312,7 +317,7 @@ def main():
         return min_lr + coeff * (max_lr - min_lr)
 
     # optimize!
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
     for step in range(max_steps):
         t0 = time.time()
@@ -327,19 +332,28 @@ def main():
             # because the gradients just add on each successive backward()
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             loss.backward()
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         optimizer.step()
-        # torch.cuda.synchronize()
+        torch.cuda.synchronize()
         t1 = time.time()
-        dt = (t1 - t0) * 1000  # time diff in ms
-        tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-        print(f"step {i} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        dt = t1 - t0
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+        tokens_per_sec = tokens_processed / dt
+        if master_process:
+            print(f"step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
+    if ddp:
+        destroy_process_group()
+    
     import sys; sys.exit(0)
 
 
