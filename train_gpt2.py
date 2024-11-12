@@ -1,4 +1,5 @@
 from dataclasses import dataclass 
+import os
 import math
 import time
 import torch
@@ -229,16 +230,43 @@ class DataLoaderLite:
         return x, y
 
 
+# simple launch:
+# python train_gpt2.py
+
+# distributed launch:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
 def main():
 
-    # autodetect the device
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    device = 'cpu'
-    print(f"using device: {device}")
+    from torch.distributed import init_process_group, destroy_process_group
+
+    # set up DDP (distributed data parallel)
+    # torchrun command sets the env variables RANK, WORLD_SIZE, LOCAL_RANK
+    ddp = int(os.environ.get('RANK', -1)) != -1  # is this a ddp run?
+    if ddp:
+        # use of DDP atm demands CUDA, we set the device appropriately according to rank
+        assert torch.cuda.is_available(), "for now we need CUDA for DDP"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0  # this process will do logging, checkpointing, etc.
+    else:     
+        # vanilla non-DDP run
+        ddp_rank = 0
+        ddp_local_rank = 0  
+        ddp_world_size = 1
+        master_process = True
+        # autodetect the device
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        device = 'cpu'
+        print(f"using device: {device}")
 
     torch.manual_seed(1337)
     if torch.cuda.is_available():
@@ -247,23 +275,15 @@ def main():
     total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
     B = 16  # micro batch size
     T = 1024 # sequence length (cropped to block_size)
-    assert total_batch_size // (B * T)
-    grad_accum_steps = total_batch_size // (B * T)
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    assert total_batch_size % (B * T) == 0, "make sure total bach size is divisible by B * T * ddp_world_size"
+    grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+    if master_process:
+        print(f"total desired batch size: {total_batch_size}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-    # # get a data batch
-    # import tiktoken
-    # enc = tiktoken.get_encoding('gpt2')
-    # with open('input.txt', 'r') as f:
-    #     text = f.read()
-    # text = text[:1000]
-    # tokens = enc.encode(text)
-    # B, T = 4, 32
-    # buf = torch.tensor(tokens[:B * T + 1])
-    # buf = buf.to(device)
-    # x = buf[:-1].view(B, T)
-    # y = buf[1:].view(B, T)
+    print("I am GPU", ddp_rank)
+    print("Bye!")
+    import sys; sys.exit(0)
 
     train_loader = DataLoaderLite(B=B, T=T)
 
