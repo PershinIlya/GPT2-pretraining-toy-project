@@ -2,11 +2,14 @@ from dataclasses import dataclass
 import os
 import math
 import time
+import datetime
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
 import inspect
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 
 class CausalSelfAttention(nn.Module):
@@ -76,8 +79,8 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
+    n_layer: int = 12  # original GPT-2 has 12 layers
+    n_head: int = 12  # original GPT-2 has 12 heads
     n_embd: int = 768
 
 class GPT(nn.Module):
@@ -94,7 +97,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # weith sharing scheme
+        # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
 
         # init params
@@ -132,49 +135,64 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+    def save_checkpoint(self, model, optimizer, step, loss, checkpoint_dir='checkpoints'):
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"checkpoint_{timestamp}_step_{step}.pth"
+        checkpoint_path = os.path.join(checkpoint_dir, filename)
+        torch.save({
+            'step': step,
+            'loss': loss,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, checkpoint_path)
+        print(f"Checkpoint saved at {checkpoint_path}")
 
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':      dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
-            'gpt2-large':  dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
-            'gpt2-xl':     dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
-        }[model_type]
-        config_args['vocab_size'] = 50257
-        config_args['block_size'] = 1024
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        assert len(sd_keys) == len(sd_keys_hf), f'mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}'
-        for k in sd_keys_hf:
-            if any(k.endswith(t) for t in transposed):
-                assert sd_hf[k].shape[::-1] == sd[k].shape 
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+    # @classmethod
+    # def from_pretrained(cls, model_type):
+    #     """Loads pretrained GPT-2 model weights from huggingface"""
+    #     assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+    #     from transformers import GPT2LMHeadModel
+    #     print("loading weights from pretrained gpt: %s" % model_type)
 
-        return model
+    #     # n_layer, n_head and n_embd are determined from model_type
+    #     config_args = {
+    #         'gpt2':      dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+    #         'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
+    #         'gpt2-large':  dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+    #         'gpt2-xl':     dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
+    #     }[model_type]
+    #     config_args['vocab_size'] = 50257
+    #     config_args['block_size'] = 1024
+    #     config = GPTConfig(**config_args)
+    #     model = GPT(config)
+    #     sd = model.state_dict()
+    #     sd_keys = sd.keys()
+    #     sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
+
+    #     # init a huggingface/transformers model
+    #     model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+    #     sd_hf = model_hf.state_dict()
+
+    #     # copy while ensuring all the parameters are aligned and match in names and shapes
+    #     sd_keys_hf = sd_hf.keys()
+    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+    #     transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+    #     assert len(sd_keys) == len(sd_keys_hf), f'mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}'
+    #     for k in sd_keys_hf:
+    #         if any(k.endswith(t) for t in transposed):
+    #             assert sd_hf[k].shape[::-1] == sd[k].shape 
+    #             with torch.no_grad():
+    #                 sd[k].copy_(sd_hf[k].t())
+    #         else:
+    #             assert sd_hf[k].shape == sd[k].shape
+    #             with torch.no_grad():
+    #                 sd[k].copy_(sd_hf[k])
+
+    #     return model
 
     def configure_optimizers(self, weight_decay, learning_rate, device):
         # start with all the candidate parameters (that require grad)
@@ -267,7 +285,6 @@ def main():
             device = "cuda"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             device = "mps"
-        device = 'cpu'
         print(f"using device: {device}")
 
     torch.manual_seed(1337)
@@ -275,17 +292,18 @@ def main():
         torch.cuda.manual_seed(1337)
         
     total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-    B = 16  # micro batch size
-    T = 1024 # sequence length (cropped to block_size)
-    assert total_batch_size % (B * T) == 0, "make sure total bach size is divisible by B * T * ddp_world_size"
+    # total_batch_size = 2048
+    B = 16  # micro batch size  (16)
+    T = 1024 # sequence length (cropped to block_size) (256)
+    assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total batch size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
         print(f"total desired batch size: {total_batch_size}")
         print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     print("I am GPU", ddp_rank)
-    print("Bye!")
-    import sys; sys.exit(0)
+    # print("Bye!")
+    # import sys; sys.exit(0)
 
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
@@ -294,15 +312,17 @@ def main():
     # create model
     model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
-    model = torch.compile(model)
+    # model = torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-    max_lr = 3e-4
+    max_lr = 6e-4
     min_lr = max_lr * 0.1
     warmup_steps = 10
-    max_steps = 20
+    max_steps = 50
+    save_interval = 10
+
     def get_lr(it):
         # 1) linear warmup
         if it < warmup_steps:
@@ -349,12 +369,17 @@ def main():
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = tokens_processed / dt
         if master_process:
-            print(f"step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        if step % save_interval == 0:
+            raw_model.save_checkpoint(model, optimizer, step, loss_accum.item())
 
     if ddp:
         destroy_process_group()
+
+    # save the final checkpoint
+    raw_model.save_checkpoint(model, optimizer, step, loss_accum.item())
     
-    import sys; sys.exit(0)
+    # import sys; sys.exit(0)
 
 
     # prefix tokens
@@ -369,7 +394,7 @@ def main():
     tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
     x = tokens.to(device)
-    x = tokens
+    # x = tokens
 
     # generate! right now x is (B, T) where B = 5, T = 8
     # set the seed to 42
@@ -378,7 +403,7 @@ def main():
     while x.size(1) < max_length:
         # forward the model to get the logits
         with torch.no_grad():
-            logits = model(x)  # (B, T, vocab_size)
+            logits, _ = model(x)  # (B, T, vocab_size)
             logits = logits[:, -1, :]  # (B, vocab_size)
             probs = F.softmax(logits, dim=-1)
             topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
