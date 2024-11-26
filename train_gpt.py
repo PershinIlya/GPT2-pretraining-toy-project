@@ -1,16 +1,6 @@
 import os
 import math
 import time
-
-# import debugpy
-# rank = int(os.environ.get('LOCAL_RANK', '0'))
-# port = 5678 + rank  # Each process will listen on a different port
-
-# print(f"Process {rank} waiting for debugger attach on port {port}")
-# debugpy.listen(port)
-# debugpy.wait_for_client()
-# print(f"Process {rank} debugger attached!"ddp)
-
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -53,7 +43,7 @@ def main():
         torch.cuda.manual_seed(1337)
 
     total_batch_size = 524288  # in number of tokens
-    B = 16  # micro batch size
+    B = 46  # micro batch size
     T = 1024  # sequence length
     # assert (
     #     total_batch_size % (B * T * ddp_world_size) == 0
@@ -65,8 +55,11 @@ def main():
 
     print("I am GPU", ddp_rank)
 
-    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, 
-                                  split="train")
+    train_loader = DataLoaderLite(
+        B=B, T=T, 
+        process_rank=ddp_rank, num_processes=ddp_world_size, master_process=master_process, 
+        split="train"
+        )
 
     torch.set_float32_matmul_precision('high')
 
@@ -82,7 +75,7 @@ def main():
     min_lr = max_lr * 0.1
     warmup_steps = 715
     max_steps = 19073
-    save_interval = 10
+    save_interval = 100
 
     def get_lr(it):
         if it < warmup_steps:

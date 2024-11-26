@@ -3,6 +3,7 @@ import os
 import math
 import time
 import datetime
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -219,11 +220,11 @@ class GPT(nn.Module):
 
 def load_tokens(filename):
     npt = np.load(filename)
-    ppt = torch.tensor(npt., dtype=torch.long)
+    ppt = torch.tensor(npt, dtype=torch.long)
     return ppt
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, master_process, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
