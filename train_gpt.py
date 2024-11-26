@@ -1,18 +1,32 @@
 import os
 import math
 import time
+
+# import debugpy
+# rank = int(os.environ.get('LOCAL_RANK', '0'))
+# port = 5678 + rank  # Each process will listen on a different port
+
+# print(f"Process {rank} waiting for debugger attach on port {port}")
+# debugpy.listen(port)
+# debugpy.wait_for_client()
+# print(f"Process {rank} debugger attached!"ddp)
+
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+
 
 from gpt import GPT, GPTConfig, DataLoaderLite
 
 def main():
     from torch.distributed import init_process_group, destroy_process_group
 
+    print(f"RANK={os.environ.get('RANK')}, LOCAL_RANK={os.environ.get('LOCAL_RANK')}, WORLD_SIZE={os.environ.get('WORLD_SIZE')}")
+
     # Set up DDP
     ddp = int(os.environ.get('RANK', -1)) != -1
+
     if ddp:
         assert torch.cuda.is_available(), "CUDA is required for DDP"
         init_process_group(backend='nccl')
@@ -41,9 +55,9 @@ def main():
     total_batch_size = 524288  # in number of tokens
     B = 16  # micro batch size
     T = 1024  # sequence length
-    assert (
-        total_batch_size % (B * T * ddp_world_size) == 0
-    ), "Total batch size must be divisible by B * T * ddp_world_size"
+    # assert (
+    #     total_batch_size % (B * T * ddp_world_size) == 0
+    # ), "Total batch size must be divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
         print(f"total desired batch size: {total_batch_size}")
@@ -51,23 +65,23 @@ def main():
 
     print("I am GPU", ddp_rank)
 
-    train_loader = DataLoaderLite(
-        B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size
-    )
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, 
+                                  split="train")
 
     torch.set_float32_matmul_precision('high')
 
     # Create model
     model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
+    model = torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
     max_lr = 6e-4
     min_lr = max_lr * 0.1
-    warmup_steps = 10
-    max_steps = 50
+    warmup_steps = 715
+    max_steps = 19073
     save_interval = 10
 
     def get_lr(it):
@@ -119,14 +133,15 @@ def main():
             print(
                 f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
             )
-        if step % save_interval == 0:
-            raw_model.save_checkpoint(model, optimizer, step, loss_accum.item())
+            if step % save_interval == 0:
+                raw_model.save_checkpoint(model, optimizer, step, loss_accum.item())
 
     if ddp:
         destroy_process_group()
 
     # Save the final checkpoint
-    raw_model.save_checkpoint(model, optimizer, step, loss_accum.item())
+    if master_process:
+        raw_model.save_checkpoint(model, optimizer, step, loss_accum.item())
 
     # Generation
     model.eval()
@@ -160,3 +175,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# ddp launch:
+# torchrun --standalone --nproc_per_node=4 train_gpt.py
