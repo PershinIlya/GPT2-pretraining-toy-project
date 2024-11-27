@@ -194,7 +194,7 @@ class GPT(nn.Module):
 
     #     return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, device):
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # start with all the candidate parameters (that require grad)
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -212,7 +212,7 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tenssors: {len(nodecay_params)}, with {num_nodecay_params} parameters")
         # create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and 'cuda' in device
+        use_fused = fused_available and device_type == "cuda"
         print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
         return optimizer
@@ -241,22 +241,12 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
+        self.reset()
 
-        # state init at shard zero
-        self.current_shard = 0 
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
-
-        # # at init load tokens from disk and store them in memory
-        # with open('input.txt', 'r') as f:
-        #     text = f.read() 
-        # enc = tiktoken.get_encoding('gpt2')
-        # tokens = enc.encode(text)
-        # self.tokens = torch.tensor(tokens)
-        # print(f"loaded {len(tokens)} tokens")
-        # print(f"1 epoch = {len(tokens) // (B * T)} batches")
-              
-        # state
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
